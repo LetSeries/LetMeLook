@@ -1,0 +1,19 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven { url = "https://maven.fabricmc.net/" }
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven { url = "https://maven.fabricmc.net/" }
+        maven { url = "https://repo.papermc.io/repository/maven-public/" }
+    }
+}
+
+rootProject.name = "letmelook"
+include("letmelook-common")
+include("letmelook-purpur")
+include("letmelook-client")

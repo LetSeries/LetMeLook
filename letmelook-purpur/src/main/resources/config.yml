@@ -1,0 +1,6 @@
+# LetMeLook server config (W1)
+limits:
+  # max blocks per request region (default 128x128x64)
+  max-volume: 1048576
+  # per-player cooldown between lookups
+  cooldown-ms: 3000

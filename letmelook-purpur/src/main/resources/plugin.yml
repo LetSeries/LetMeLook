@@ -1,0 +1,14 @@
+name: LetMeLook
+version: 0.1.0
+main: com.letseries.letmelook.bukkit.LetMeLookPlugin
+api-version: 1.20
+author: LetSeries
+description: CoreProtect replay bridge for LetMeLook Fabric client (Purpur 1.21.11)
+depend: [CoreProtect]
+permissions:
+  letmelook.use:
+    description: Request replay lookups
+    default: op
+  letmelook.admin:
+    description: Admin controls
+    default: op

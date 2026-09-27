@@ -1,0 +1,13 @@
+.gradle/
+build/
+*/build/
+out/
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+run/
+libs/*.jar
+!libs/CoreProtect-CE-24.1.jar
+!libs/README.md
