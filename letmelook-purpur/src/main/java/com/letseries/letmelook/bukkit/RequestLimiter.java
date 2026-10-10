@@ -21,6 +21,11 @@ final class RequestLimiter {
 
     /** Returns null when allowed, otherwise a human-readable reason. */
     synchronized String check(Player player, LookupRequest req) {
+        if (req.min == null || req.max == null
+                || req.min.length < 3 || req.max.length < 3
+                || req.world == null || req.world.isEmpty()) {
+            return "malformed request (missing region/world)";
+        }
         long volume = (long) (req.max[0] - req.min[0] + 1)
                 * (req.max[1] - req.min[1] + 1)
                 * (req.max[2] - req.min[2] + 1);

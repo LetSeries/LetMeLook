@@ -1,6 +1,9 @@
-# LetMeLook server config (W1)
+# LetMeLook server config (W2)
 limits:
   # max blocks per request region (default 128x128x64)
   max-volume: 1048576
   # per-player cooldown between lookups
   cooldown-ms: 3000
+  # target encoded bytes per TimelineChunk page (server halves the
+  # event count until the gzipped page fits; min 64 events/page)
+  page-bytes: 65536
