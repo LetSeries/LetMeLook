@@ -1,18 +1,29 @@
 package com.letseries.letmelook.client.timeline;
 
 import com.letseries.letmelook.common.BlockEvent;
+import com.letseries.letmelook.common.LetMeLookProtocol;
 import com.letseries.letmelook.common.TimelineChunk;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * W2 in-memory timeline: accumulates paged {@link TimelineChunk}s, keeps them
+ * In-memory timeline: accumulates paged {@link TimelineChunk}s, keeps them
  * time-sorted, and exposes a playhead (epoch millis) used by the ghost
  * renderer and the time slider.
  *
- * <p>Playback modes (see {@code /lm mode}): REPLAY applies all events with
- * {@code t <= playhead}; DIFF applies only the delta at the playhead window.
+ * <p>Playback modes (see {@code /lm mode}):
+ * <ul>
+ *   <li>{@link Mode#REPLAY} / {@link Mode#ROLLBACK} — every event at or before
+ *       the playhead; the renderer folds these into a last-writer-wins world
+ *       reconstruction.</li>
+ *   <li>{@link Mode#DIFF} — only events inside the {@link #diffWindowMs()}
+ *       window ending at the playhead, i.e. "what changed just now".</li>
+ * </ul>
+ *
+ * <p>W3 fixes two W2 defects: a page from a superseded request could clear the
+ * timeline that replaced it, and {@code isComplete()} never became true for an
+ * empty result or a refused request.
  */
 public final class ReplayTimeline {
     public enum Mode {
@@ -24,38 +35,93 @@ public final class ReplayTimeline {
     private final List<BlockEvent> events = new ArrayList<>();
     private int lastRequestId = -1;
     private int lastTotal = 0;
+    private int pages = 0;
+    private boolean truncated = false;
+    private boolean settled = false;
+    private int pendingRequestId = -1;
 
-    /** Playhead in epoch millis; {@link Long#MAX_VALUE} = show everything. */
+    /** Monotonic counter bumped whenever the event set changes (render caches). */
+    private long revision = 0L;
+
+    /**
+     * Playhead in epoch millis. {@link Long#MAX_VALUE} means "pinned to the
+     * newest event": pages arriving later are immediately visible instead of
+     * being stuck in the future, and it stays pinned until the user scrubs,
+     * plays or the exporter moves it.
+     */
     private long playheadMs = Long.MAX_VALUE;
     private Mode mode = Mode.REPLAY;
     private boolean playing = false;
     private double speed = 4.0;
-    private int pendingRequestId = -1;
+    private long diffWindowMs = LetMeLookProtocol.DEFAULT_DIFF_WINDOW_SECONDS * 1000L;
 
     public synchronized void ingest(TimelineChunk chunk) {
         if (chunk == null) {
             return;
         }
+        if (pendingRequestId >= 0 && chunk.requestId != pendingRequestId) {
+            // A page from a request the player already replaced: ignore it
+            // instead of clearing the newer timeline.
+            return;
+        }
         if (chunk.requestId != lastRequestId) {
             events.clear();
             lastRequestId = chunk.requestId;
+            lastTotal = 0;
+            pages = 0;
+            truncated = false;
+            settled = false;
             playheadMs = Long.MAX_VALUE;
         }
-        lastTotal = chunk.total;
-        if (chunk.events != null) {
+        lastTotal = Math.max(lastTotal, chunk.total);
+        if (chunk.pages > 0) {
+            pages = chunk.pages;
+        }
+        if (chunk.truncated) {
+            truncated = true;
+        }
+        if (chunk.events != null && !chunk.events.isEmpty()) {
             events.addAll(chunk.events);
+            events.sort((a, b) -> Long.compare(a.t, b.t));
         }
-        events.sort((a, b) -> Long.compare(a.t, b.t));
-        if (!events.isEmpty() && playheadMs == Long.MAX_VALUE) {
-            playheadMs = events.get(events.size() - 1).t;
+        if (lastTotal > 0 && events.size() >= lastTotal) {
+            settled = true;
         }
+        revision++;
+    }
+
+    /**
+     * Mark the request as fully answered by the server (a terminal
+     * {@code LookupStatus} arrived). This is what makes {@code isComplete()}
+     * meaningful for an empty or refused request, where no page ever arrives.
+     */
+    public synchronized void markSettled(int requestId) {
+        if (requestId < 0) {
+            // The server could not read the request id (malformed payload): the
+            // error is still surfaced to the player, but it must not settle
+            // whichever request is currently pending.
+            return;
+        }
+        if (requestId != lastRequestId) {
+            return; // stale status for a superseded request
+        }
+        settled = true;
+        if (pendingRequestId == requestId) {
+            pendingRequestId = -1;
+        }
+        revision++;
     }
 
     public synchronized void clear() {
         events.clear();
         lastRequestId = -1;
         lastTotal = 0;
+        pages = 0;
+        truncated = false;
+        settled = false;
+        pendingRequestId = -1;
         playheadMs = Long.MAX_VALUE;
+        revision++;
     }
 
     public synchronized int eventCount() {
@@ -66,25 +132,45 @@ public final class ReplayTimeline {
         return lastTotal;
     }
 
+    public synchronized int pages() {
+        return pages;
+    }
+
+    public synchronized boolean truncated() {
+        return truncated;
+    }
+
     public synchronized int requestId() {
         return lastRequestId;
     }
 
     public synchronized boolean isComplete() {
-        return lastTotal > 0 && events.size() >= lastTotal;
+        return settled || (lastTotal > 0 && events.size() >= lastTotal);
     }
 
-    /** Events with {@code t <= playhead} (what the ghost layer renders). */
+    public synchronized long revision() {
+        return revision;
+    }
+
+    /**
+     * Events the renderer should consider at the playhead. In
+     * {@link Mode#DIFF} only the window ending at the playhead is returned;
+     * otherwise every event up to the playhead (the renderer reconstructs the
+     * last-writer-wins world state from these).
+     */
     public synchronized List<BlockEvent> visibleAtPlayhead() {
-        if (playheadMs == Long.MAX_VALUE) {
-            return new ArrayList<>(events);
+        if (events.isEmpty()) {
+            return new ArrayList<>();
         }
+        long head = playhead();
+        long from = mode == Mode.DIFF ? head - diffWindowMs : Long.MIN_VALUE;
         List<BlockEvent> out = new ArrayList<>();
         for (BlockEvent e : events) {
-            if (e.t <= playheadMs) {
-                out.add(e);
-            } else {
+            if (e.t > head) {
                 break;
+            }
+            if (e.t >= from) {
+                out.add(e);
             }
         }
         return out;
@@ -106,12 +192,12 @@ public final class ReplayTimeline {
     }
 
     public synchronized void setPlayhead(long ms) {
-        long lo = minTime();
-        long hi = maxTime();
         if (events.isEmpty()) {
             playheadMs = Long.MAX_VALUE;
             return;
         }
+        long lo = minTime();
+        long hi = maxTime();
         this.playheadMs = Math.max(lo, Math.min(hi, ms));
     }
 
@@ -142,7 +228,10 @@ public final class ReplayTimeline {
     }
 
     public synchronized void setMode(Mode mode) {
-        this.mode = mode;
+        if (mode != null) {
+            this.mode = mode;
+            revision++;
+        }
     }
 
     public synchronized boolean isPlaying() {
@@ -150,6 +239,13 @@ public final class ReplayTimeline {
     }
 
     public synchronized void setPlaying(boolean playing) {
+        // Pressing play while the playhead sits at the end (the default while the
+        // stream is pinned to "show everything") should replay from the start,
+        // not stop instantly on the first tick.
+        if (playing && !events.isEmpty()
+                && (playheadMs == Long.MAX_VALUE || playhead() >= maxTime())) {
+            playheadMs = minTime();
+        }
         this.playing = playing;
     }
 
@@ -162,6 +258,20 @@ public final class ReplayTimeline {
         this.speed = Math.max(0.1, Math.min(256.0, speed));
     }
 
+    /** Lookback window used by {@link Mode#DIFF}, in seconds. */
+    public synchronized double diffWindowSeconds() {
+        return diffWindowMs / 1000.0;
+    }
+
+    public synchronized void setDiffWindowSeconds(double seconds) {
+        this.diffWindowMs = (long) Math.max(1.0, Math.min(3600.0, seconds)) * 1000L;
+        revision++;
+    }
+
+    public synchronized long diffWindowMs() {
+        return diffWindowMs;
+    }
+
     /** Advance the playhead when playing (called once per client tick). */
     public synchronized void tick(double deltaSeconds) {
         if (!playing || events.isEmpty()) {
@@ -169,8 +279,7 @@ public final class ReplayTimeline {
         }
         long lo = minTime();
         long hi = maxTime();
-        long cur = playhead();
-        long next = cur + (long) (deltaSeconds * speed() * 1000.0);
+        long next = playhead() + (long) (deltaSeconds * speed() * 1000.0);
         if (next >= hi) {
             next = hi;
             playing = false;
@@ -187,7 +296,11 @@ public final class ReplayTimeline {
         this.events.clear();
         this.lastRequestId = requestId;
         this.lastTotal = 0;
+        this.pages = 0;
+        this.truncated = false;
+        this.settled = false;
         this.playheadMs = Long.MAX_VALUE;
+        revision++;
     }
 
     public synchronized int pendingRequestId() {

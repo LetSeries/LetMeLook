@@ -1,9 +1,20 @@
-# LetMeLook server config (W2)
+# LetMeLook server config (W3)
 limits:
-  # max blocks per request region (default 128x128x64)
+  # max blocks per request region (default 128x128x64); <= 0 disables lookups
   max-volume: 1048576
   # per-player cooldown between lookups
   cooldown-ms: 3000
+  # per-player request cap over any rolling minute (0 = no cap)
+  requests-per-minute: 12
   # target encoded bytes per TimelineChunk page (server halves the
   # event count until the gzipped page fits; min 64 events/page)
   page-bytes: 65536
+  # hard cap on events collected for one request; the reply is flagged
+  # "truncated" when the scan stops here
+  max-events: 50000
+  # hard cap on pages per request (safety valve for tiny page-bytes)
+  max-pages: 512
+  # pages sent to the client per server tick (each page is <= page-bytes)
+  pages-per-tick: 4
+  # per-player limiter state is dropped after this much idle time
+  state-ttl-ms: 900000

@@ -6,7 +6,7 @@ plugins {
     id("fabric-loom") version "1.17.21"
 }
 
-version = "0.1.0"
+version = "0.2.0"
 group = "com.letseries.letmelook"
 
 base {
@@ -30,6 +30,10 @@ dependencies {
     // share protocol classes; loom `include` bundles them into the mod jar
     include(implementation(project(":letmelook-common"))!!)
     include(implementation("com.google.code.gson:gson:2.11.0")!!)
+
+    // ReplayTimeline is Minecraft-free, so timeline tests run without a game.
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.4")
 }
 
 tasks.named<ProcessResources>("processResources") {

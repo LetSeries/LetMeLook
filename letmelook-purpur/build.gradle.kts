@@ -12,6 +12,10 @@ dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
     compileOnly(files("../libs/CoreProtect-CE-24.1.jar"))
     compileOnly("com.google.code.gson:gson:2.11.0")
+
+    // RequestLimiter is deliberately Bukkit-free, so its tests need no server API.
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.4")
 }
 
 // bundle common classes into the plugin jar (no shadow plugin needed for scaffold)

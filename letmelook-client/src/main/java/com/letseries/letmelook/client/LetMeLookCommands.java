@@ -5,7 +5,9 @@ import com.letseries.letmelook.client.export.TimelapseExporter;
 import com.letseries.letmelook.client.net.NetChannels;
 import com.letseries.letmelook.client.render.GhostLayer;
 import com.letseries.letmelook.client.selection.SelectionState;
+import com.letseries.letmelook.client.state.LookupStatusTracker;
 import com.letseries.letmelook.client.timeline.ReplayTimeline;
+import com.letseries.letmelook.client.ui.HudOverlay;
 import com.letseries.letmelook.client.ui.TimeSliderScreen;
 import com.letseries.letmelook.common.Codec;
 import com.letseries.letmelook.common.LetMeLookProtocol;
@@ -20,16 +22,19 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 
 /**
- * W2 client commands:
+ * Client commands:
  * <ul>
- *   <li>/lm pos1|pos2 — capture selection corners</li>
+ *   <li>/lm pos1|pos2 — capture selection corners (dimension-aware)</li>
  *   <li>/lm lookup &lt;seconds&gt; [user] — send LookupRequest to the server</li>
- *   <li>/lm status — selection + ingest progress</li>
+ *   <li>/lm status — selection + timeline + last server status</li>
  *   <li>/lm time — open the time slider screen</li>
  *   <li>/lm play|pause|speed — timelapse playback controls</li>
  *   <li>/lm mode replay|rollback|diff — ghost render mode</li>
+ *   <li>/lm window &lt;seconds&gt; — DIFF-mode lookback window</li>
+ *   <li>/lm hud — toggle the on-screen overlay</li>
  *   <li>/lm hide|show|clear — ghost visibility + buffer</li>
  *   <li>/lm cam add|clear|play|stop — camera path waypoints</li>
  *   <li>/lm export &lt;fps&gt; &lt;seconds&gt; — screenshot burst + ffmpeg script</li>
@@ -42,31 +47,39 @@ final class LetMeLookCommands {
     private LetMeLookCommands() {}
 
     static void register(SelectionState selection, GhostLayer ghostLayer, CameraPath cameraPath,
-            TimelapseExporter exporter) {
+            TimelapseExporter exporter, LookupStatusTracker statuses, HudOverlay hud) {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             var lm = ClientCommandManager.literal("lm");
 
             lm.then(ClientCommandManager.literal("pos1").executes(ctx -> {
                 var p = ctx.getSource().getPlayer().getBlockPos();
-                selection.setPos1(p.getX(), p.getY(), p.getZ());
-                ctx.getSource().sendFeedback(Text.literal("LetMeLook pos1 = " + p.toShortString()));
+                boolean reset = selection.setPos1(p.getX(), p.getY(), p.getZ(),
+                        currentDim(ctx.getSource()));
+                ctx.getSource().sendFeedback(Text.literal("LetMeLook pos1 = " + fmtPos(p)
+                        + " @" + SelectionState.shortDim(selection.dimension())
+                        + (reset ? " (cleared pos2: different dimension)" : "")));
                 return 1;
             }));
 
             lm.then(ClientCommandManager.literal("pos2").executes(ctx -> {
                 var p = ctx.getSource().getPlayer().getBlockPos();
-                selection.setPos2(p.getX(), p.getY(), p.getZ());
-                ctx.getSource().sendFeedback(Text.literal("LetMeLook pos2 = " + p.toShortString()));
+                boolean reset = selection.setPos2(p.getX(), p.getY(), p.getZ(),
+                        currentDim(ctx.getSource()));
+                ctx.getSource().sendFeedback(Text.literal("LetMeLook pos2 = " + fmtPos(p)
+                        + " @" + SelectionState.shortDim(selection.dimension())
+                        + (reset ? " (cleared pos1: different dimension)" : "")));
                 return 1;
             }));
 
             lm.then(ClientCommandManager.literal("status").executes(ctx -> {
-                String sel = selection.hasSelection()
-                        ? java.util.Arrays.toString(selection.min()) + " -> "
-                                + java.util.Arrays.toString(selection.max())
-                        : "none";
-                ctx.getSource().sendFeedback(Text.literal(
-                        "LetMeLook selection=" + sel + " " + ghostLayer.summary()));
+                var src = ctx.getSource();
+                boolean hasSel = selection.hasSelection();
+                src.sendFeedback(Text.literal("LetMeLook sel=" + selection.describe())
+                        .formatted(hasSel ? Formatting.WHITE : Formatting.GRAY));
+                src.sendFeedback(Text.literal("LetMeLook timeline " + ghostLayer.summary())
+                        .formatted(Formatting.GRAY));
+                src.sendFeedback(Text.literal("LetMeLook server " + statuses.summary())
+                        .formatted(Formatting.GRAY));
                 return 1;
             }));
 
@@ -112,14 +125,32 @@ final class LetMeLookCommands {
                     }))
                     .then(ClientCommandManager.literal("rollback").executes(ctx -> {
                         ghostLayer.timeline().setMode(ReplayTimeline.Mode.ROLLBACK);
-                        ctx.getSource().sendFeedback(Text.literal("LetMeLook mode=rollback"));
+                        ctx.getSource().sendFeedback(Text.literal(
+                                "LetMeLook mode=rollback (shows blocks a rollback to the playhead would change)"));
                         return 1;
                     }))
                     .then(ClientCommandManager.literal("diff").executes(ctx -> {
                         ghostLayer.timeline().setMode(ReplayTimeline.Mode.DIFF);
-                        ctx.getSource().sendFeedback(Text.literal("LetMeLook mode=diff"));
+                        ctx.getSource().sendFeedback(Text.literal("LetMeLook mode=diff window="
+                                + (long) ghostLayer.timeline().diffWindowSeconds() + "s"));
                         return 1;
                     })));
+
+            lm.then(ClientCommandManager.literal("window")
+                    .then(ClientCommandManager.argument("seconds", IntegerArgumentType.integer(1, 3600))
+                            .executes(ctx -> {
+                                int seconds = IntegerArgumentType.getInteger(ctx, "seconds");
+                                ghostLayer.timeline().setDiffWindowSeconds(seconds);
+                                ctx.getSource().sendFeedback(Text.literal(
+                                        "LetMeLook diff window=" + seconds + "s"));
+                                return 1;
+                            })));
+
+            lm.then(ClientCommandManager.literal("hud").executes(ctx -> {
+                boolean on = hud.toggle();
+                ctx.getSource().sendFeedback(Text.literal("LetMeLook overlay " + (on ? "on" : "off")));
+                return 1;
+            }));
 
             lm.then(ClientCommandManager.literal("hide").executes(ctx -> {
                 ghostLayer.setVisible(false);
@@ -192,6 +223,14 @@ final class LetMeLookCommands {
         });
     }
 
+    private static String currentDim(net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource src) {
+        return src.getWorld().getRegistryKey().getValue().toString();
+    }
+
+    private static String fmtPos(net.minecraft.util.math.BlockPos p) {
+        return "(" + p.getX() + "," + p.getY() + "," + p.getZ() + ")";
+    }
+
     private static int sendLookup(net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource src,
             SelectionState selection, GhostLayer ghostLayer, int seconds, String user) {
         if (!selection.hasSelection()) {
@@ -203,7 +242,7 @@ final class LetMeLookCommands {
             return 0;
         }
         LookupRequest req = new LookupRequest();
-        req.world = src.getWorld().getRegistryKey().getValue().toString();
+        req.world = currentDim(src);
         req.min = selection.min();
         req.max = selection.max();
         long now = System.currentTimeMillis();
@@ -232,7 +271,8 @@ final class LetMeLookCommands {
         }
         ghostLayer.timeline().setRequestId(req.requestId);
         src.sendFeedback(Text.literal("LetMeLook lookup req=" + req.requestId + " (" + seconds + "s"
-                + (user != null ? " user=" + user : "") + ")"));
+                + (user != null ? " user=" + user : "") + ") "
+                + selection.describe()));
         return 1;
     }
 }

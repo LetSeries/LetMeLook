@@ -9,10 +9,11 @@ import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 
 /**
- * W2 time slider: scrub the replay playhead, play/pause, speed, mode.
- * Open with {@code /lm time}.
+ * Time slider: scrub the replay playhead, play/pause, speed, mode.
+ * Open with {@code /lm time} or the timeline keybind.
  */
 public final class TimeSliderScreen extends Screen {
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
@@ -37,23 +38,46 @@ public final class TimeSliderScreen extends Screen {
                 b -> {
                     timeline.setPlaying(!timeline.isPlaying());
                     b.setMessage(Text.literal(timeline.isPlaying() ? "Pause" : "Play"));
-                }).dimensions(cx - 150, height - 52, 70, 20).build());
+                }).dimensions(cx - 150, height - 52, 56, 20).build());
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Speed: " + fmtSpeed()),
                 b -> {
-                    double s = nextSpeed(timeline.speed());
-                    timeline.setSpeed(s);
+                    timeline.setSpeed(nextSpeed(timeline.speed()));
                     b.setMessage(Text.literal("Speed: " + fmtSpeed()));
-                }).dimensions(cx - 72, height - 52, 80, 20).build());
+                }).dimensions(cx - 90, height - 52, 80, 20).build());
 
-        addDrawableChild(ButtonWidget.builder(Text.literal("Mode: " + timeline.mode().name()),
+        addDrawableChild(ButtonWidget.builder(Text.literal("Mode: " + modeLabel()),
                 b -> {
                     timeline.setMode(nextMode(timeline.mode()));
-                    b.setMessage(Text.literal("Mode: " + timeline.mode().name()));
-                }).dimensions(cx + 16, height - 52, 90, 20).build());
+                    b.setMessage(Text.literal("Mode: " + modeLabel()));
+                }).dimensions(cx - 6, height - 52, 100, 20).build());
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
-                .dimensions(cx + 114, height - 52, 60, 20).build());
+                .dimensions(cx + 98, height - 52, 52, 20).build());
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("|<"), b -> {
+            timeline.setPlaying(false);
+            timeline.setPlayheadFraction(0.0);
+        }).dimensions(cx - 150, height - 28, 30, 18).build());
+
+        addDrawableChild(ButtonWidget.builder(Text.literal(">|"), b -> {
+            timeline.setPlaying(false);
+            timeline.setPlayheadFraction(1.0);
+        }).dimensions(cx + 120, height - 28, 30, 18).build());
+
+        addDrawableChild(ButtonWidget.builder(
+                Text.literal("Window: " + (long) timeline.diffWindowSeconds() + "s"),
+                b -> {
+                    timeline.setDiffWindowSeconds(nextWindow(timeline.diffWindowSeconds()));
+                    b.setMessage(Text.literal("Window: " + (long) timeline.diffWindowSeconds() + "s"));
+                }).dimensions(cx - 60, height - 28, 100, 18).build());
+    }
+
+    private String modeLabel() {
+        if (timeline.mode() == ReplayTimeline.Mode.DIFF) {
+            return "DIFF " + (long) timeline.diffWindowSeconds() + "s";
+        }
+        return timeline.mode().name();
     }
 
     private String fmtSpeed() {
@@ -71,6 +95,16 @@ public final class TimeSliderScreen extends Screen {
         return 1;
     }
 
+    private static double nextWindow(double s) {
+        double[] steps = {5, 15, 30, 60, 300, 900, 3600};
+        for (double st : steps) {
+            if (st > s + 0.01) {
+                return st;
+            }
+        }
+        return 5;
+    }
+
     private static ReplayTimeline.Mode nextMode(ReplayTimeline.Mode m) {
         return switch (m) {
             case REPLAY -> ReplayTimeline.Mode.ROLLBACK;
@@ -82,14 +116,27 @@ public final class TimeSliderScreen extends Screen {
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
         super.render(ctx, mouseX, mouseY, delta);
-        ctx.drawCenteredTextWithShadow(textRenderer, "LetMeLook Timeline", width / 2, 20, 0xFFFFFF);
+        ctx.drawCenteredTextWithShadow(textRenderer, "LetMeLook Timeline", width / 2, 16, 0xFFFFFF);
         long lo = timeline.minTime();
         long hi = timeline.maxTime();
         long cur = timeline.playhead();
         String range = timeline.eventCount() == 0 ? "no data — run /lm lookup first"
                 : fmt(lo) + "  ->  " + fmt(cur) + "  /  " + fmt(hi)
                         + "   (" + timeline.eventCount() + "/" + timeline.expectedTotal() + " events)";
-        ctx.drawCenteredTextWithShadow(textRenderer, range, width / 2, 36, 0xAAAAAA);
+        ctx.drawCenteredTextWithShadow(textRenderer, range, width / 2, 32, 0xAAAAAA);
+
+        String meta = "mode=" + timeline.mode().name()
+                + "  pages=" + timeline.pages()
+                + "  visible=" + (timeline.eventCount() > 0)
+                + (timeline.isComplete() ? "  complete" : "  loading…");
+        ctx.drawCenteredTextWithShadow(textRenderer, meta, width / 2, 44, 0x888888);
+
+        if (timeline.truncated()) {
+            ctx.drawCenteredTextWithShadow(textRenderer,
+                    Text.literal("result TRUNCATED at the server event cap — narrow the region or time range")
+                            .formatted(Formatting.GOLD),
+                    width / 2, 58, 0xFFAA00);
+        }
         if (slider != null) {
             slider.sync();
         }

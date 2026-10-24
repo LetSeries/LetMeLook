@@ -4,6 +4,7 @@ import com.letseries.letmelook.client.timeline.ReplayTimeline;
 import com.letseries.letmelook.common.BlockEvent;
 import com.letseries.letmelook.common.TimelineChunk;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -17,9 +18,7 @@ import net.minecraft.client.render.RenderLayers;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.render.VertexRendering;
 import net.minecraft.client.util.math.MatrixStack;
-import net.minecraft.command.argument.BlockArgumentParser;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.RegistryKeys;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ColorHelper;
@@ -27,30 +26,46 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShapes;
 
 /**
- * W2 ghost renderer: translucent historical-state overlay.
+ * Ghost renderer: translucent historical-state overlay.
  *
- * <p>Design (verified against 1.21.11 mappings):
+ * <p>Design:
  * <ul>
  *   <li>All vertices go through {@code consumers().getBuffer(...)} with
  *       coordinates <b>relative to the camera</b> (Fabric docs requirement);
  *       the {@link MatrixStack} from the render event is NOT translated, the
  *       per-box offset is baked into the vertex positions.</li>
- *   <li>History skin: the historical {@code to} BlockState is submitted via
- *       {@code commandQueue().submitBlock(...)} — wait, no: submitBlock draws
- *       the full opaque model, which would hide the real world. Instead we draw
- *       two debug passes: a translucent fill ({@code debugFilledBox}) plus a
- *       colored outline ({@code lines}), tinted by action (place=green,
- *       break=red) or white in ROLLBACK preview.</li>
- *   <li>Cap: at most {@link #MAX_BOXES} boxes per frame, oldest-first, so a
- *       50k-event timeline can't freeze the renderer.</li>
+ *   <li>REPLAY/ROLLBACK fold the visible events into a last-writer-wins world
+ *       reconstruction (one box per position that still has a block), so
+ *       overlapping edits no longer stack boxes. DIFF renders the raw window.</li>
+ *   <li>ROLLBACK additionally drops positions whose live client-side block
+ *       already matches the reconstructed state — what remains is exactly what a
+ *       rollback to the playhead would change.</li>
+ *   <li>Cap: at most {@link #MAX_BOXES} boxes per frame, chosen nearest-first,
+ *       refreshed only when the candidate set changes or the camera moves.</li>
  * </ul>
  */
 public final class GhostLayer {
     /** Max ghost boxes drawn per frame (perf guard). */
     public static final int MAX_BOXES = 4096;
 
+    /** Recompute the nearest-box selection once the camera has moved this far (blocks²). */
+    private static final double NEAREST_REFRESH_DIST_SQ = 16.0;
+
+    /** Bounded cache of parsed state strings (registry lookup + property parse). */
+    private static final int STATE_CACHE_CAP = 512;
+    private static final Map<String, BlockState> STATE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
     private final ReplayTimeline timeline = new ReplayTimeline();
     private boolean visible = true;
+
+    // Render caches -------------------------------------------------------
+    private long cacheKey = Long.MIN_VALUE;
+    private List<BlockEvent> candidates = List.of();
+    private List<BlockEvent> nearest = List.of();
+    private double nearestCamX;
+    private double nearestCamY;
+    private double nearestCamZ;
+    private boolean hasNearest;
 
     public ReplayTimeline timeline() {
         return timeline;
@@ -80,8 +95,20 @@ public final class GhostLayer {
         this.visible = visible;
     }
 
+    public void toggleVisible() {
+        this.visible = !this.visible;
+    }
+
     public void clear() {
         timeline.clear();
+        invalidate();
+    }
+
+    private void invalidate() {
+        cacheKey = Long.MIN_VALUE;
+        candidates = List.of();
+        nearest = List.of();
+        hasNearest = false;
     }
 
     public static void register(GhostLayer layer) {
@@ -95,55 +122,133 @@ public final class GhostLayer {
 
     private void renderFill(MatrixStack matrices, net.minecraft.client.render.VertexConsumerProvider consumers,
             Vec3d cameraPos) {
-        if (!visible || timeline.eventCount() == 0) {
+        if (!visible) {
             return;
         }
-        List<BlockEvent> events = timeline.visibleAtPlayhead();
+        List<BlockEvent> events = renderList(cameraPos);
         if (events.isEmpty()) {
             return;
         }
         VertexConsumer buffer = consumers.getBuffer(RenderLayers.debugFilledBox());
         var entry = matrices.peek();
-        int drawn = 0;
         boolean rollback = timeline.mode() == ReplayTimeline.Mode.ROLLBACK;
-        for (int i = events.size() - 1; i >= 0 && drawn < MAX_BOXES; i--) {
-            BlockEvent e = events.get(i);
+        MinecraftClient mc = MinecraftClient.getInstance();
+        for (BlockEvent e : events) {
             if (e.action == 0 && "minecraft:air".equals(e.to)) {
                 continue; // broken-away blocks have no ghost volume
+            }
+            if (rollback && matchesLiveWorld(mc, e)) {
+                continue; // already in the reconstructed state: nothing to roll back
             }
             float x = e.x - (float) cameraPos.getX();
             float y = e.y - (float) cameraPos.getY();
             float z = e.z - (float) cameraPos.getZ();
-            int color = ghostColor(e, rollback, 0.22f);
-            quad(buffer, entry, x, y, z, x + 1, y + 1, z + 1, color);
-            drawn++;
+            quad(buffer, entry, x, y, z, x + 1, y + 1, z + 1, ghostColor(e, rollback, 0.22f));
         }
     }
 
     private void renderOutlines(MatrixStack matrices, net.minecraft.client.render.VertexConsumerProvider consumers,
             Vec3d cameraPos) {
-        if (!visible || timeline.eventCount() == 0) {
+        if (!visible) {
             return;
         }
-        List<BlockEvent> events = timeline.visibleAtPlayhead();
+        List<BlockEvent> events = renderList(cameraPos);
         if (events.isEmpty()) {
             return;
         }
         VertexConsumer lines = consumers.getBuffer(RenderLayers.lines());
         boolean rollback = timeline.mode() == ReplayTimeline.Mode.ROLLBACK;
-        int drawn = 0;
-        for (int i = events.size() - 1; i >= 0 && drawn < MAX_BOXES; i--) {
-            BlockEvent e = events.get(i);
+        MinecraftClient mc = MinecraftClient.getInstance();
+        for (BlockEvent e : events) {
+            if (rollback && matchesLiveWorld(mc, e)) {
+                continue;
+            }
             double x = e.x - cameraPos.getX();
             double y = e.y - cameraPos.getY();
             double z = e.z - cameraPos.getZ();
-            int color = ghostColor(e, rollback, 1.0f);
-            VertexRendering.drawOutline(matrices, lines, VoxelShapes.fullCube(), x, y, z, color, 0.02f);
-            drawn++;
+            VertexRendering.drawOutline(matrices, lines, VoxelShapes.fullCube(), x, y, z,
+                    ghostColor(e, rollback, 1.0f), 0.02f);
         }
     }
 
-    /** Place = green, break = red, rollback preview = amber/white. */
+    /** True when the live client world already matches the reconstructed state. */
+    private static boolean matchesLiveWorld(MinecraftClient mc, BlockEvent e) {
+        if (mc == null || mc.world == null) {
+            return false;
+        }
+        BlockState live = mc.world.getBlockState(new BlockPos(e.x, e.y, e.z));
+        return live.equals(parseState(e.to));
+    }
+
+    // ------------------------------------------------------------------
+    // Candidate selection
+    // ------------------------------------------------------------------
+
+    /**
+     * The events to consider this frame: mode-filtered, last-writer-wins folded
+     * for REPLAY/ROLLBACK, capped to the {@link #MAX_BOXES} nearest boxes.
+     */
+    private List<BlockEvent> renderList(Vec3d cameraPos) {
+        List<BlockEvent> all = candidateEvents();
+        if (all.isEmpty()) {
+            return all;
+        }
+        if (all.size() <= MAX_BOXES) {
+            return all;
+        }
+        double dx = cameraPos.getX() - nearestCamX;
+        double dy = cameraPos.getY() - nearestCamY;
+        double dz = cameraPos.getZ() - nearestCamZ;
+        boolean moved = dx * dx + dy * dy + dz * dz > NEAREST_REFRESH_DIST_SQ;
+        if (hasNearest && !moved) {
+            return nearest;
+        }
+        List<BlockEvent> sorted = new ArrayList<>(all);
+        sorted.sort(Comparator.comparingDouble(e -> distanceSq(e, cameraPos)));
+        nearest = new ArrayList<>(sorted.subList(0, MAX_BOXES));
+        nearestCamX = cameraPos.getX();
+        nearestCamY = cameraPos.getY();
+        nearestCamZ = cameraPos.getZ();
+        hasNearest = true;
+        return nearest;
+    }
+
+    /** Mode-filtered events, folded to one event per position for REPLAY/ROLLBACK. */
+    private List<BlockEvent> candidateEvents() {
+        long key = cacheKey();
+        if (key == cacheKey) {
+            return candidates;
+        }
+        List<BlockEvent> visibleEvents = timeline.visibleAtPlayhead();
+        List<BlockEvent> folded;
+        if (timeline.mode() == ReplayTimeline.Mode.DIFF) {
+            folded = visibleEvents;
+        } else {
+            folded = new ArrayList<>(reconstructAt(visibleEvents, timeline.playhead()).values());
+        }
+        candidates = folded;
+        cacheKey = key;
+        nearest = List.of();
+        hasNearest = false;
+        return candidates;
+    }
+
+    private long cacheKey() {
+        long key = timeline.revision();
+        key = key * 31 + timeline.playhead();
+        key = key * 31 + timeline.mode().ordinal();
+        key = key * 31 + timeline.diffWindowMs();
+        return key;
+    }
+
+    private static double distanceSq(BlockEvent e, Vec3d cam) {
+        double dx = e.x + 0.5 - cam.getX();
+        double dy = e.y + 0.5 - cam.getY();
+        double dz = e.z + 0.5 - cam.getZ();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    /** Place = green, break = red, rollback preview = amber. */
     static int ghostColor(BlockEvent e, boolean rollback, float alpha) {
         float r;
         float g;
@@ -208,18 +313,34 @@ public final class GhostLayer {
 
     // ------------------------------------------------------------------
     // BlockState parsing: "minecraft:oak_stairs[facing=north]" -> BlockState.
-    // Used by the timelapse exporter and rollback preview screen to resolve
-    // historical states against the client's registry.
+    // Used by the ghost renderer, the rollback preview and the exporter to
+    // resolve historical states against the client's registry.
     // ------------------------------------------------------------------
 
     /**
      * Resolve a state string against the client registry. Unknown ids fall back
      * to the closest known block (namespace-tolerant), then to air.
+     *
+     * <p>Results are memoised (bounded) because the rollback pass resolves up to
+     * {@link #MAX_BOXES} state strings per frame.
      */
     public static BlockState parseState(String s) {
         if (s == null || s.isEmpty()) {
             return Blocks.AIR.getDefaultState();
         }
+        BlockState cached = STATE_CACHE.get(s);
+        if (cached != null) {
+            return cached;
+        }
+        BlockState state = parseStateUncached(s);
+        if (STATE_CACHE.size() >= STATE_CACHE_CAP) {
+            STATE_CACHE.clear();
+        }
+        STATE_CACHE.put(s, state);
+        return state;
+    }
+
+    private static BlockState parseStateUncached(String s) {
         String id = s;
         String props = "";
         int lb = s.indexOf('[');
@@ -289,6 +410,9 @@ public final class GhostLayer {
      * Reconstruct the world state at the playhead for a region: later events
      * overwrite earlier ones per position (last-writer-wins). Returned map key
      * is the packed {@code BlockPos#asLong}.
+     *
+     * <p>Requires {@code events} to be time-sorted (as {@link ReplayTimeline}
+     * keeps them); iteration stops at the first event newer than the playhead.
      */
     public static Map<Long, BlockEvent> reconstructAt(List<BlockEvent> events, long playheadMs) {
         Map<Long, BlockEvent> out = new LinkedHashMap<>();
@@ -305,12 +429,25 @@ public final class GhostLayer {
     public String summary() {
         MinecraftClient mc = MinecraftClient.getInstance();
         String dim = mc.world != null ? mc.world.getRegistryKey().getValue().toString() : "?";
-        return "events=" + eventCount() + "/" + expectedTotal() + " dim=" + dim
-                + " mode=" + timeline.mode().name().toLowerCase(Locale.ROOT);
+        StringBuilder sb = new StringBuilder();
+        sb.append("events=").append(eventCount()).append('/').append(expectedTotal())
+                .append(" dim=").append(dim)
+                .append(" mode=").append(timeline.mode().name().toLowerCase(Locale.ROOT))
+                .append(timeline.mode() == ReplayTimeline.Mode.DIFF
+                        ? "(" + (long) timeline.diffWindowSeconds() + "s)" : "")
+                .append(" visible=").append(visible)
+                .append(" complete=").append(isComplete());
+        if (timeline.truncated()) {
+            sb.append(" TRUNCATED");
+        }
+        return sb.toString();
     }
 
-    /** Snapshot of visible events (for exporter / UI). */
+    /**
+     * Snapshot of the events the renderer would consider (for the exporter / UI).
+     * Unaffected by the per-frame nearest-box cap.
+     */
     public List<BlockEvent> visibleSnapshot() {
-        return new ArrayList<>(timeline.visibleAtPlayhead());
+        return new ArrayList<>(candidateEvents());
     }
 }
